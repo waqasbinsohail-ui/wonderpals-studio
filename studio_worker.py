@@ -1,17 +1,15 @@
 import os
 import time
-import requests
 from supabase import create_client, Client
 from moviepy.editor import ImageClip, AudioFileClip
 from elevenlabs.client import ElevenLabs
+from huggingface_hub import InferenceClient
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 HF_API_TOKEN = os.getenv("HF_API_TOKEN")  # Hugging Face free inference API token
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")  # set this to Leo's chosen voice
-
-HF_MODEL_URL = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell"
 
 REQUIRED_VARS = {
     "SUPABASE_URL": SUPABASE_URL,
@@ -26,42 +24,37 @@ if missing:
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 elevenlabs = ElevenLabs(api_key=ELEVENLABS_API_KEY)
+hf_client = InferenceClient(
+    provider="hf-inference",
+    api_key=HF_API_TOKEN,
+)
 
 
 def generate_scene_image(prompt: str, out_path: str, max_retries: int = 5):
-    """Generate a WonderPals scene image with Hugging Face's free Inference API.
+    """Generate a WonderPals scene image via Hugging Face's free hf-inference provider.
 
     Note: this does not use the trained Leo LoRA (that required fal.ai's paid
     LoRA endpoint). Character consistency relies on the locked style prompt text.
-    HF's free tier can return a 503 while the model cold-starts — this retries
-    with backoff when that happens.
+    Retries with backoff if the model is cold-starting (503/loading).
     """
-    headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
-    payload = {"inputs": prompt}
-
     for attempt in range(max_retries):
-        resp = requests.post(HF_MODEL_URL, headers=headers, json=payload, timeout=120)
-
-        if resp.status_code == 200:
-            with open(out_path, "wb") as f:
-                f.write(resp.content)
+        try:
+            image = hf_client.text_to_image(
+                prompt,
+                model="black-forest-labs/FLUX.1-schnell",
+            )
+            image.save(out_path)
             return
+        except Exception as e:
+            msg = str(e)
+            if "503" in msg or "loading" in msg.lower():
+                wait_time = 20
+                print(f"Model loading, waiting {wait_time}s (attempt {attempt + 1}/{max_retries})...")
+                time.sleep(wait_time)
+                continue
+            raise
 
-        if resp.status_code == 503:
-            # Model is loading (cold start) - HF tells us how long to wait
-            wait_time = 20
-            try:
-                wait_time = resp.json().get("estimated_time", 20)
-            except Exception:
-                pass
-            print(f"Model loading, waiting {wait_time:.0f}s (attempt {attempt + 1}/{max_retries})...")
-            time.sleep(wait_time)
-            continue
-
-        # Any other error - raise with the response body for debugging
-        resp.raise_for_status()
-
-    raise RuntimeError(f"HF inference API did not return an image after {max_retries} attempts")
+    raise RuntimeError(f"HF inference did not return an image after {max_retries} attempts")
 
 
 def generate_narration_audio(text: str, out_path: str):
