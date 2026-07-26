@@ -5,3 +5,4 @@ python-dotenv
 elevenlabs
 requests
 discord.py
+huggingface_hub
