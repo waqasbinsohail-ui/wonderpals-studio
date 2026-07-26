@@ -11,7 +11,7 @@ HF_API_TOKEN = os.getenv("HF_API_TOKEN")  # Hugging Face free inference API toke
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")  # set this to Leo's chosen voice
 
-HF_MODEL_URL = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-dev"
+HF_MODEL_URL = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-dev"
 
 REQUIRED_VARS = {
     "SUPABASE_URL": SUPABASE_URL,
