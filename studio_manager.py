@@ -58,6 +58,7 @@ def queue_episode_jobs(episode_data):
         job_payload = {
             "prompt": scene["prompt"],
             "narration": scene["narrator_text"],
+            "task_type": "video_generation",
             "status": "pending",
             "metadata": json.dumps({
                 "episode": episode_data["episode_number"],
