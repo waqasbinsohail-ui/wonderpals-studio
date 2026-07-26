@@ -1,0 +1,8 @@
+supabase
+moviepy==1.0.3
+pillow
+python-dotenv
+fal-client
+elevenlabs
+requests
+discord.py
