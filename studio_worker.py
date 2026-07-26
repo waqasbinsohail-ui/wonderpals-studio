@@ -11,6 +11,8 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 FAL_KEY = os.getenv("FAL_KEY")  # fal_client reads this env var automatically
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")  # set this to Leo's chosen voice
+LEO_LORA_URL = os.getenv("LEO_LORA_URL")  # set after running train_leo_lora.py
+LEO_TRIGGER_WORD = os.getenv("LEO_TRIGGER_WORD", "leocub")
 
 REQUIRED_VARS = {
     "SUPABASE_URL": SUPABASE_URL,
@@ -28,15 +30,30 @@ elevenlabs = ElevenLabs(api_key=ELEVENLABS_API_KEY)
 
 
 def generate_scene_image(prompt: str, out_path: str):
-    """Generate a WonderPals scene image with fal.ai and download it locally."""
-    result = fal_client.subscribe(
-        "fal-ai/flux/dev",
-        arguments={
-            "prompt": prompt,
-            "image_size": "landscape_16_9",
-            "num_images": 1,
-        },
-    )
+    """Generate a WonderPals scene image with fal.ai and download it locally.
+
+    Uses the trained Leo LoRA for consistent design if LEO_LORA_URL is set,
+    otherwise falls back to plain flux/dev (design will drift between shots).
+    """
+    if LEO_LORA_URL:
+        result = fal_client.subscribe(
+            "fal-ai/flux-lora",
+            arguments={
+                "prompt": f"{LEO_TRIGGER_WORD}, {prompt}",
+                "loras": [{"path": LEO_LORA_URL, "scale": 1.0}],
+                "image_size": "landscape_16_9",
+                "num_images": 1,
+            },
+        )
+    else:
+        result = fal_client.subscribe(
+            "fal-ai/flux/dev",
+            arguments={
+                "prompt": prompt,
+                "image_size": "landscape_16_9",
+                "num_images": 1,
+            },
+        )
     image_url = result["images"][0]["url"]
     resp = requests.get(image_url, timeout=60)
     resp.raise_for_status()
@@ -75,7 +92,15 @@ def run_worker():
     while True:
         job_id = None
         try:
-            res = supabase.table("video_jobs").select("*").eq("status", "pending").limit(1).execute()
+            res = (
+                supabase.table("video_jobs")
+                .select("*")
+                .eq("status", "pending")
+                .eq("task_type", "video_generation")
+                .order("created_at")
+                .limit(1)
+                .execute()
+            )
             jobs = res.data
 
             if jobs:
