@@ -3,7 +3,7 @@ import time
 import base64
 import requests
 from supabase import create_client, Client
-from moviepy.editor import ImageClip, AudioFileClip
+from moviepy.editor import ImageClip, AudioFileClip, CompositeVideoClip
 from elevenlabs.client import ElevenLabs
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -80,18 +80,35 @@ def generate_narration_audio(text: str, out_path: str):
                 f.write(chunk)
 
 
-def render_scene_video(image_path: str, audio_path: str, output_path: str):
-    """Combine the generated image + narration into a single scene video clip."""
+def render_scene_video(image_path: str, audio_path: str, output_path: str, zoom_factor: float = 1.15):
+    """Combine the generated image + narration into a scene video clip,
+    with a slow Ken Burns zoom effect for a sense of motion."""
     audio_clip = AudioFileClip(audio_path)
-    image_clip = ImageClip(image_path).set_duration(audio_clip.duration).set_audio(audio_clip)
-    image_clip.write_videofile(
+    duration = audio_clip.duration
+
+    def zoom(t):
+        return 1 + (zoom_factor - 1) * (t / duration)
+
+    image_clip = (
+        ImageClip(image_path)
+        .resize(zoom)
+        .set_duration(duration)
+        .set_position("center")
+    )
+
+    video = (
+        CompositeVideoClip([image_clip])
+        .set_duration(duration)
+        .set_audio(audio_clip)
+    )
+
+    video.write_videofile(
         output_path,
         fps=24,
         codec="libx264",
         audio_codec="aac",
         logger=None,
     )
-
 
 def run_worker():
     print("Worker active - waiting for scene jobs...")
