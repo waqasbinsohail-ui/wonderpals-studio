@@ -1,5 +1,6 @@
 supabase
 openai
 elevenlabs
+fal-client
 requests
 python-dotenv
