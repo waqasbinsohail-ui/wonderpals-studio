@@ -1,11 +1,19 @@
 import os
 import time
 import requests
-import uuid
 from supabase import create_client, Client
-from video_stitcher import assemble_full_episode  # Import our stitcher script
+from moviepy.editor import (
+    ImageClip,
+    VideoFileClip,
+    AudioFileClip,
+    TextClip,
+    CompositeVideoClip,
+    concatenate_videoclips,
+)
 
-# Supabase Setup
+# ----------------------------------------------------
+# 1. Supabase & Storage Configuration
+# ----------------------------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -13,8 +21,85 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 BUCKET_NAME = "wonderpals-outputs"
 
 
+# ----------------------------------------------------
+# 2. Video Stitcher Logic
+# ----------------------------------------------------
+def create_scene_clip(visual_path: str, audio_path: str, caption_text: str):
+    """Combines a single visual asset, voiceover audio, and styled captions."""
+    audio = AudioFileClip(audio_path)
+    scene_duration = audio.duration
+
+    if visual_path.endswith((".mp4", ".mov", ".webm")):
+        visual_clip = VideoFileClip(visual_path)
+        if visual_clip.duration < scene_duration:
+            visual_clip = visual_clip.loop(duration=scene_duration)
+        else:
+            visual_clip = visual_clip.subclip(0, scene_duration)
+    else:
+        visual_clip = ImageClip(visual_path).set_duration(scene_duration)
+
+    visual_clip = visual_clip.resize(newsize=(1920, 1080))
+
+    try:
+        subtitle = TextClip(
+            caption_text,
+            fontsize=60,
+            color="yellow",
+            font="Arial-Bold",
+            stroke_color="black",
+            stroke_width=3,
+            method="caption",
+            size=(1600, None),
+        ).set_duration(scene_duration).set_position(("center", 900))
+        
+        scene_clip = CompositeVideoClip([visual_clip, subtitle])
+    except Exception as e:
+        print(f"⚠️ Subtitle rendering skipped: {e}")
+        scene_clip = visual_clip
+
+    scene_clip = scene_clip.set_audio(audio)
+    return scene_clip
+
+
+def assemble_full_episode(scenes: list, output_filepath: str) -> str:
+    """Stitches multiple scene clips sequentially into a full MP4 episode."""
+    print(f"✂️ Stitching {len(scenes)} scenes into final video...")
+    rendered_clips = []
+
+    for idx, scene in enumerate(scenes, start=1):
+        print(f"   └─ Processing Scene {idx}/{len(scenes)}...")
+        clip = create_scene_clip(
+            visual_path=scene["visual"],
+            audio_path=scene["audio"],
+            caption_text=scene["caption"]
+        )
+        rendered_clips.append(clip)
+
+    final_video = concatenate_videoclips(rendered_clips, method="compose")
+
+    print("🎥 Rendering final MP4 file...")
+    final_video.write_videofile(
+        output_filepath,
+        fps=24,
+        codec="libx264",
+        audio_codec="aac",
+        threads=4,
+        preset="fast"
+    )
+
+    final_video.close()
+    for clip in rendered_clips:
+        clip.close()
+
+    print(f"🎉 Episode rendered: {output_filepath}")
+    return output_filepath
+
+
+# ----------------------------------------------------
+# 3. Helper Functions
+# ----------------------------------------------------
 def download_file(url: str, local_path: str) -> str:
-    """Helper to download remote URLs (S3/Supabase assets) to local disk for FFmpeg."""
+    """Downloads remote asset URLs locally for processing."""
     response = requests.get(url, stream=True)
     response.raise_for_status()
     with open(local_path, "wb") as f:
@@ -24,43 +109,29 @@ def download_file(url: str, local_path: str) -> str:
 
 
 def upload_to_supabase_storage(local_filepath: str, destination_name: str) -> str:
-    """Uploads rendered MP4 to Supabase Storage and returns the public CDN URL."""
-    print(f"☁️ Uploading {destination_name} to Supabase Storage bucket '{BUCKET_NAME}'...")
-    
+    """Uploads rendered video to Supabase Storage."""
+    print(f"☁️ Uploading to Supabase Storage bucket '{BUCKET_NAME}'...")
     with open(local_filepath, "rb") as f:
         supabase.storage.from_(BUCKET_NAME).upload(
             file=f,
             path=destination_name,
             file_options={"content-type": "video/mp4", "upsert": "true"}
         )
-
-    # Get Public URL
-    public_url = supabase.storage.from_(BUCKET_NAME).get_public_url(destination_name)
-    return public_url
+    return supabase.storage.from_(BUCKET_NAME).get_public_url(destination_name)
 
 
+# ----------------------------------------------------
+# 4. Worker Queue Handler
+# ----------------------------------------------------
 def process_leo_phase_1_batch(job_id: str, payload: dict):
-    """
-    Handles 'generate_leo_phase_1_batch' jobs:
-    Payload structure expected:
-    {
-      "scenes": [
-        {"visual": "https://...", "audio": "https://...", "caption": "Hi I'm Leo!"},
-        ...
-      ]
-    }
-    """
-    print(f"🎬 Processing Leo Phase 1 Batch for Job ID: {job_id}...")
     scenes_data = payload.get("scenes", [])
-
     if not scenes_data:
-        raise ValueError("Job payload is missing the 'scenes' list.")
+        raise ValueError("Job payload missing 'scenes' array.")
 
     local_scenes = []
     temp_files = []
 
     try:
-        # Step 1: Download raw assets to local temporary files
         for i, scene in enumerate(scenes_data):
             vis_ext = ".mp4" if ".mp4" in scene["visual"].lower() else ".png"
             local_vis = f"/tmp/scene_{i}_vis_{job_id[:8]}{vis_ext}"
@@ -78,17 +149,14 @@ def process_leo_phase_1_batch(job_id: str, payload: dict):
                 "caption": scene.get("caption", "")
             })
 
-        # Step 2: Render full MP4 locally
         output_filename = f"leo_episode_{job_id[:8]}.mp4"
         local_output_path = f"/tmp/{output_filename}"
-        
+
         assemble_full_episode(local_scenes, output_filepath=local_output_path)
         temp_files.append(local_output_path)
 
-        # Step 3: Upload output MP4 to Supabase Storage
         public_video_url = upload_to_supabase_storage(local_output_path, f"episodes/{output_filename}")
 
-        # Step 4: Mark Job as completed in Supabase
         supabase.table("jobs").update({
             "status": "completed",
             "result_url": public_video_url,
@@ -98,18 +166,17 @@ def process_leo_phase_1_batch(job_id: str, payload: dict):
         print(f"✨ Job {job_id} finished! Output: {public_video_url}")
 
     finally:
-        # Step 5: Clean up temporary files on local disk
         for file_path in temp_files:
             if os.path.exists(file_path):
                 os.remove(file_path)
 
 
-def poll_worker_loop():
-    """Main worker loop looking for pending tasks."""
+# ----------------------------------------------------
+# 5. Main Execution Loop
+# ----------------------------------------------------
+if __name__ == "__main__":
     print("🚀 WonderPals Studio Worker listening for jobs...")
-    
     while True:
-        # Fetch pending job
         res = supabase.table("jobs").select("*").eq("status", "pending").limit(1).execute()
         jobs = res.data
 
@@ -120,8 +187,6 @@ def poll_worker_loop():
             payload = job.get("payload", {})
 
             print(f"⚡ Job Picked Up: Processing {task_type} ({job_id})")
-
-            # Update status to processing
             supabase.table("jobs").update({"status": "processing"}).eq("id", job_id).execute()
 
             try:
@@ -129,7 +194,6 @@ def poll_worker_loop():
                     process_leo_phase_1_batch(job_id, payload)
                 else:
                     print(f"Unknown task type: {task_type}")
-                    
             except Exception as e:
                 print(f"❌ Error processing job {job_id}: {e}")
                 supabase.table("jobs").update({
@@ -138,7 +202,3 @@ def poll_worker_loop():
                 }).eq("id", job_id).execute()
         else:
             time.sleep(5)
-
-
-if __name__ == "__main__":
-    poll_worker_loop()
