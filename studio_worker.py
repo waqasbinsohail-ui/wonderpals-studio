@@ -1,128 +1,144 @@
 import os
 import time
 import requests
-import fal_client
-from openai import OpenAI
-from supabase import create_client
+import uuid
+from supabase import create_client, Client
+from video_stitcher import assemble_full_episode  # Import our stitcher script
 
-# Environment Variables
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+# Supabase Setup
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Initialize Clients
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY) if (SUPABASE_URL and SUPABASE_KEY) else None
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+BUCKET_NAME = "wonderpals-outputs"
 
-def send_discord_notification(content, embed_data=None):
-    """Sends messages and embed previews to Discord channel"""
-    if not DISCORD_WEBHOOK_URL:
-        print("Missing DISCORD_WEBHOOK_URL")
-        return
+
+def download_file(url: str, local_path: str) -> str:
+    """Helper to download remote URLs (S3/Supabase assets) to local disk for FFmpeg."""
+    response = requests.get(url, stream=True)
+    response.raise_for_status()
+    with open(local_path, "wb") as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            f.write(chunk)
+    return local_path
+
+
+def upload_to_supabase_storage(local_filepath: str, destination_name: str) -> str:
+    """Uploads rendered MP4 to Supabase Storage and returns the public CDN URL."""
+    print(f"☁️ Uploading {destination_name} to Supabase Storage bucket '{BUCKET_NAME}'...")
     
-    payload = {"content": content}
-    if embed_data:
-        payload["embeds"] = [embed_data]
-        
-    requests.post(DISCORD_WEBHOOK_URL, json=payload)
-
-def generate_image_fal(prompt):
-    """Generates 3D character asset using Fal.ai FLUX"""
-    print(f"🎨 Generating image with prompt: {prompt}")
-    result = fal_client.subscribe(
-        "fal-ai/flux/dev",
-        arguments={
-            "prompt": prompt,
-            "image_size": "landscape_16_9",
-            "num_inference_steps": 28
-        }
-    )
-    return result["images"][0]["url"]
-
-def run_vision_qc(image_url):
-    """Uses GPT-4o Vision to score image quality and character consistency"""
-    print("🔍 Running GPT-4o Vision QC Check...")
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Rate this 3D cartoon character asset on visual quality, lighting, and kid-friendliness from 1 to 100. Respond with ONLY the number."},
-                        {"type": "image_url", "image_url": {"url": image_url}}
-                    ]
-                }
-            ],
-            max_tokens=10
+    with open(local_filepath, "rb") as f:
+        supabase.storage.from_(BUCKET_NAME).upload(
+            file=f,
+            path=destination_name,
+            file_options={"content-type": "video/mp4", "upsert": "true"}
         )
-        score_text = response.choices[0].message.content.strip()
-        score = int(''.join(filter(str.isdigit, score_text)))
-        return score
-    except Exception as e:
-        print(f"QC check fallback: {e}")
-        return 88
 
-def process_pending_jobs():
-    """Polls Supabase for pending jobs and executes them"""
-    if not supabase:
-        print("Supabase client not initialized.")
-        return
+    # Get Public URL
+    public_url = supabase.storage.from_(BUCKET_NAME).get_public_url(destination_name)
+    return public_url
 
-    # Check for pending tasks
-    res = supabase.table("jobs").select("*").eq("status", "pending").execute()
-    jobs = res.data
 
-    if not jobs:
-        print("No pending jobs found in queue.")
-        send_discord_notification("ℹ️ **Worker Online:** No pending jobs in Supabase queue. Idle and ready!")
-        return
+def process_leo_phase_1_batch(job_id: str, payload: dict):
+    """
+    Handles 'generate_leo_phase_1_batch' jobs:
+    Payload structure expected:
+    {
+      "scenes": [
+        {"visual": "https://...", "audio": "https://...", "caption": "Hi I'm Leo!"},
+        ...
+      ]
+    }
+    """
+    print(f"🎬 Processing Leo Phase 1 Batch for Job ID: {job_id}...")
+    scenes_data = payload.get("scenes", [])
 
-    for job in jobs:
-        job_id = job["id"]
-        task_type = job["task_type"]
-        print(f"Processing Job ID: {job_id} ({task_type})")
+    if not scenes_data:
+        raise ValueError("Job payload is missing the 'scenes' list.")
 
-        # Mark job as processing
-        supabase.table("jobs").update({"status": "processing"}).eq("id", job_id).execute()
+    local_scenes = []
+    temp_files = []
 
-        if task_type == "generate_leo_phase_1_batch":
-            # Fetch Leo's character prompt template from database
-            char_res = supabase.table("characters").select("*").eq("name", "Leo the Lion").execute()
-            character = char_res.data[0] if char_res.data else None
-            prompt = character["prompt_template"] if character else "3D Pixar style character render, cute friendly lion cub named Leo, big cheerful eyes, vibrant studio lighting, high detail, 8k"
+    try:
+        # Step 1: Download raw assets to local temporary files
+        for i, scene in enumerate(scenes_data):
+            vis_ext = ".mp4" if ".mp4" in scene["visual"].lower() else ".png"
+            local_vis = f"/tmp/scene_{i}_vis_{job_id[:8]}{vis_ext}"
+            local_aud = f"/tmp/scene_{i}_aud_{job_id[:8]}.mp3"
 
-            send_discord_notification(f"⚡ **Job Picked Up:** Processing `{task_type}` from Supabase...")
+            print(f"   └─ Downloading assets for Scene {i+1}...")
+            download_file(scene["visual"], local_vis)
+            download_file(scene["audio"], local_aud)
 
-            # 1. Generate Image
-            image_url = generate_image_fal(prompt)
-            
-            # 2. Run Vision QC
-            qc_score = run_vision_qc(image_url)
+            temp_files.extend([local_vis, local_aud])
 
-            # 3. Save asset to Supabase assets table
-            asset_data = {
-                "character_id": character["id"] if character else None,
-                "asset_type": "image",
-                "url": image_url,
-                "qc_score": qc_score
-            }
-            supabase.table("assets").insert(asset_data).execute()
+            local_scenes.append({
+                "visual": local_vis,
+                "audio": local_aud,
+                "caption": scene.get("caption", "")
+            })
 
-            # 4. Mark job as completed
-            supabase.table("jobs").update({"status": "completed"}).eq("id", job_id).execute()
+        # Step 2: Render full MP4 locally
+        output_filename = f"leo_episode_{job_id[:8]}.mp4"
+        local_output_path = f"/tmp/{output_filename}"
+        
+        assemble_full_episode(local_scenes, output_filepath=local_output_path)
+        temp_files.append(local_output_path)
 
-            # 5. Notify Discord with preview
-            embed = {
-                "title": "🎯 Phase 1 Batch Item Complete!",
-                "description": f"Generated via Fal.ai and saved to Supabase.\n**Vision QC Score:** `{qc_score}/100`",
-                "color": 3066993,
-                "image": {"url": image_url}
-            }
-            send_discord_notification("✅ **Job Successfully Finished!** Asset logged to database:", embed)
+        # Step 3: Upload output MP4 to Supabase Storage
+        public_video_url = upload_to_supabase_storage(local_output_path, f"episodes/{output_filename}")
+
+        # Step 4: Mark Job as completed in Supabase
+        supabase.table("jobs").update({
+            "status": "completed",
+            "result_url": public_video_url,
+            "error_message": None
+        }).eq("id", job_id).execute()
+
+        print(f"✨ Job {job_id} finished! Output: {public_video_url}")
+
+    finally:
+        # Step 5: Clean up temporary files on local disk
+        for file_path in temp_files:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+
+
+def poll_worker_loop():
+    """Main worker loop looking for pending tasks."""
+    print("🚀 WonderPals Studio Worker listening for jobs...")
+    
+    while True:
+        # Fetch pending job
+        res = supabase.table("jobs").select("*").eq("status", "pending").limit(1).execute()
+        jobs = res.data
+
+        if jobs:
+            job = jobs[0]
+            job_id = job["id"]
+            task_type = job.get("task_type")
+            payload = job.get("payload", {})
+
+            print(f"⚡ Job Picked Up: Processing {task_type} ({job_id})")
+
+            # Update status to processing
+            supabase.table("jobs").update({"status": "processing"}).eq("id", job_id).execute()
+
+            try:
+                if task_type == "generate_leo_phase_1_batch":
+                    process_leo_phase_1_batch(job_id, payload)
+                else:
+                    print(f"Unknown task type: {task_type}")
+                    
+            except Exception as e:
+                print(f"❌ Error processing job {job_id}: {e}")
+                supabase.table("jobs").update({
+                    "status": "failed",
+                    "error_message": str(e)
+                }).eq("id", job_id).execute()
+        else:
+            time.sleep(5)
+
 
 if __name__ == "__main__":
-    print("Starting WonderPals Studio Worker...")
-    process_pending_jobs()
+    poll_worker_loop()
