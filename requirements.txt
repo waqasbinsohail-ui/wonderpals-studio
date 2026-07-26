@@ -1,7 +1,0 @@
-supabase
-openai
-elevenlabs
-fal-client
-requests
-python-dotenv
-moviepy==1.0.3
