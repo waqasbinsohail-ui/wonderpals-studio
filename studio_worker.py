@@ -1,23 +1,22 @@
 import os
 import time
 import requests
-import fal_client
 from supabase import create_client, Client
 from moviepy.editor import ImageClip, AudioFileClip
 from elevenlabs.client import ElevenLabs
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-FAL_KEY = os.getenv("FAL_KEY")  # fal_client reads this env var automatically
+HF_API_TOKEN = os.getenv("HF_API_TOKEN")  # Hugging Face free inference API token
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")  # set this to Leo's chosen voice
-LEO_LORA_URL = os.getenv("LEO_LORA_URL")  # set after running train_leo_lora.py
-LEO_TRIGGER_WORD = os.getenv("LEO_TRIGGER_WORD", "leocub")
+
+HF_MODEL_URL = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-dev"
 
 REQUIRED_VARS = {
     "SUPABASE_URL": SUPABASE_URL,
     "SUPABASE_KEY": SUPABASE_KEY,
-    "FAL_KEY": FAL_KEY,
+    "HF_API_TOKEN": HF_API_TOKEN,
     "ELEVENLABS_API_KEY": ELEVENLABS_API_KEY,
     "ELEVENLABS_VOICE_ID": ELEVENLABS_VOICE_ID,
 }
@@ -29,36 +28,40 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 elevenlabs = ElevenLabs(api_key=ELEVENLABS_API_KEY)
 
 
-def generate_scene_image(prompt: str, out_path: str):
-    """Generate a WonderPals scene image with fal.ai and download it locally.
+def generate_scene_image(prompt: str, out_path: str, max_retries: int = 5):
+    """Generate a WonderPals scene image with Hugging Face's free Inference API.
 
-    Uses the trained Leo LoRA for consistent design if LEO_LORA_URL is set,
-    otherwise falls back to plain flux/dev (design will drift between shots).
+    Note: this does not use the trained Leo LoRA (that required fal.ai's paid
+    LoRA endpoint). Character consistency relies on the locked style prompt text.
+    HF's free tier can return a 503 while the model cold-starts — this retries
+    with backoff when that happens.
     """
-    if LEO_LORA_URL:
-        result = fal_client.subscribe(
-            "fal-ai/flux-lora",
-            arguments={
-                "prompt": f"{LEO_TRIGGER_WORD}, {prompt}",
-                "loras": [{"path": LEO_LORA_URL, "scale": 1.0}],
-                "image_size": "landscape_16_9",
-                "num_images": 1,
-            },
-        )
-    else:
-        result = fal_client.subscribe(
-            "fal-ai/flux/dev",
-            arguments={
-                "prompt": prompt,
-                "image_size": "landscape_16_9",
-                "num_images": 1,
-            },
-        )
-    image_url = result["images"][0]["url"]
-    resp = requests.get(image_url, timeout=60)
-    resp.raise_for_status()
-    with open(out_path, "wb") as f:
-        f.write(resp.content)
+    headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+    payload = {"inputs": prompt}
+
+    for attempt in range(max_retries):
+        resp = requests.post(HF_MODEL_URL, headers=headers, json=payload, timeout=120)
+
+        if resp.status_code == 200:
+            with open(out_path, "wb") as f:
+                f.write(resp.content)
+            return
+
+        if resp.status_code == 503:
+            # Model is loading (cold start) - HF tells us how long to wait
+            wait_time = 20
+            try:
+                wait_time = resp.json().get("estimated_time", 20)
+            except Exception:
+                pass
+            print(f"Model loading, waiting {wait_time:.0f}s (attempt {attempt + 1}/{max_retries})...")
+            time.sleep(wait_time)
+            continue
+
+        # Any other error - raise with the response body for debugging
+        resp.raise_for_status()
+
+    raise RuntimeError(f"HF inference API did not return an image after {max_retries} attempts")
 
 
 def generate_narration_audio(text: str, out_path: str):
