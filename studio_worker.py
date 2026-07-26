@@ -1,20 +1,23 @@
 import os
 import time
+import base64
+import requests
 from supabase import create_client, Client
 from moviepy.editor import ImageClip, AudioFileClip
 from elevenlabs.client import ElevenLabs
-from huggingface_hub import InferenceClient
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-HF_API_TOKEN = os.getenv("HF_API_TOKEN")  # Hugging Face free inference API token
+CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")
+CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")  # set this to Leo's chosen voice
 
 REQUIRED_VARS = {
     "SUPABASE_URL": SUPABASE_URL,
     "SUPABASE_KEY": SUPABASE_KEY,
-    "HF_API_TOKEN": HF_API_TOKEN,
+    "CLOUDFLARE_ACCOUNT_ID": CLOUDFLARE_ACCOUNT_ID,
+    "CLOUDFLARE_API_TOKEN": CLOUDFLARE_API_TOKEN,
     "ELEVENLABS_API_KEY": ELEVENLABS_API_KEY,
     "ELEVENLABS_VOICE_ID": ELEVENLABS_VOICE_ID,
 }
@@ -24,37 +27,44 @@ if missing:
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 elevenlabs = ElevenLabs(api_key=ELEVENLABS_API_KEY)
-hf_client = InferenceClient(
-    provider="hf-inference",
-    api_key=HF_API_TOKEN,
+
+CF_MODEL_URL = (
+    f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}"
+    f"/ai/run/@cf/black-forest-labs/flux-1-schnell"
 )
 
 
-def generate_scene_image(prompt: str, out_path: str, max_retries: int = 5):
-    """Generate a WonderPals scene image via Hugging Face's free hf-inference provider.
+def generate_scene_image(prompt: str, out_path: str, max_retries: int = 3):
+    """Generate a WonderPals scene image via Cloudflare Workers AI's free tier.
 
     Note: this does not use the trained Leo LoRA (that required fal.ai's paid
     LoRA endpoint). Character consistency relies on the locked style prompt text.
-    Retries with backoff if the model is cold-starting (503/loading).
+    Retries on rate limiting (Cloudflare's free tier has daily/rate caps).
     """
-    for attempt in range(max_retries):
-        try:
-            image = hf_client.text_to_image(
-                prompt,
-                model="black-forest-labs/FLUX.1-schnell",
-            )
-            image.save(out_path)
-            return
-        except Exception as e:
-            msg = str(e)
-            if "503" in msg or "loading" in msg.lower():
-                wait_time = 20
-                print(f"Model loading, waiting {wait_time}s (attempt {attempt + 1}/{max_retries})...")
-                time.sleep(wait_time)
-                continue
-            raise
+    headers = {"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"}
+    payload = {"prompt": prompt}
 
-    raise RuntimeError(f"HF inference did not return an image after {max_retries} attempts")
+    for attempt in range(max_retries):
+        resp = requests.post(CF_MODEL_URL, headers=headers, json=payload, timeout=60)
+
+        if resp.status_code == 200:
+            data = resp.json()
+            if not data.get("success", True) and "result" not in data:
+                raise RuntimeError(f"Cloudflare Workers AI error: {data.get('errors')}")
+            image_b64 = data["result"]["image"]
+            with open(out_path, "wb") as f:
+                f.write(base64.b64decode(image_b64))
+            return
+
+        if resp.status_code == 429:
+            wait_time = 10
+            print(f"Rate limited, waiting {wait_time}s (attempt {attempt + 1}/{max_retries})...")
+            time.sleep(wait_time)
+            continue
+
+        resp.raise_for_status()
+
+    raise RuntimeError(f"Cloudflare Workers AI did not return an image after {max_retries} attempts")
 
 
 def generate_narration_audio(text: str, out_path: str):
